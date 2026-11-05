@@ -3,5 +3,26 @@ name = "decision-as-reranker"
 version = "0.1.0"
 description = "Typed decision model as a reranker for RAG"
 readme = "README.md"
+authors = [
+    { name = "Quang Hon Ly", email = "lyhonquang@gmail.com" }
+]
 requires-python = ">=3.10"
-dependencies = []
+
+[build-system]
+requires = ["uv_build>=0.12.8,<0.13.0"]
+build-backend = "uv_build"
+
+keywords = ["llm", "decision", "jev"]
+classifiers = [
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
