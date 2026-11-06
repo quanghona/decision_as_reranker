@@ -117,17 +117,13 @@ class BaseDecisionReranker(abc.ABC):
         self._backend = backend
         self.on_error: OnError = on_error
 
-    # --------------------------------------------------------------- the injected adapter
-
     @property
     def backend(self) -> BaseDecisionBackend:
         """The adapter this reranker calls. Owned by the caller; closing it is the caller's job."""
         return self._backend
 
-    # --------------------------------------------------------------- subclass surface
-
     @abc.abstractmethod
-    def rerank(self, query: str, candidates: Sequence[str], k: int | None = None) -> list[ScoredCandidate]:
+    def rerank(self, query: str, candidates: Sequence[str]) -> list[ScoredCandidate]:
         """Order `candidates` for `query`, best first.
 
         Implemented by the subclasses; `score` and `rank` are the parts. The query is a parameter and
@@ -137,7 +133,6 @@ class BaseDecisionReranker(abc.ABC):
         Args:
             query: The information need the candidates were shortlisted against.
             candidates: The passages to rank, in input order.
-            k: How many to keep; `None` keeps every scored candidate.
 
         Returns:
             The scored candidates, ordered by score then input position, as `rank` produces them.
@@ -157,8 +152,6 @@ class BaseDecisionReranker(abc.ABC):
         """
         return {"query": query}
 
-    # --------------------------------------------------------------- the one backend call site
-
     def ask(self, state: Mapping[str, object], questions: Mapping[str, Question]) -> DecisionResponse:
         """Send one decision request. The only place this package touches a backend.
 
@@ -170,8 +163,6 @@ class BaseDecisionReranker(abc.ABC):
             The backend's `DecisionResponse`.
         """
         return self._backend.ask(state, questions)
-
-    # --------------------------------------------------------------- scoring
 
     def score(self, query: str, candidates: Sequence[str], decisions: Sequence[DecisionQuery]) -> list[float | None]:
         """Ask the model once and return one relevance in `[0, 1]` per candidate, in input order.
@@ -253,15 +244,12 @@ class BaseDecisionReranker(abc.ABC):
             values.append(sum(found) / len(found) if found else None)
         return values
 
-    # --------------------------------------------------------------- ordering
-
     def rank(
         self,
         candidates: Sequence[str],
         scores: Sequence[float | None],
-        k: int | None = None,
     ) -> list[ScoredCandidate]:
-        """Order candidates by relevance, best first, keeping the top `k`.
+        """Order candidates by relevance, descending.
 
         Duplicate texts stay separate -- they arrive from different documents and must not collapse
         into one score. Unscored candidates are excluded, not ranked last.
@@ -269,16 +257,13 @@ class BaseDecisionReranker(abc.ABC):
         Args:
             candidates: The passages, in input order.
             scores: One score (or `None`) per candidate, positionally aligned with `candidates`.
-            k: How many to keep; `None` keeps all of them.
 
         Returns:
             The scored candidates, ordered by score then input position.
 
         Raises:
-            ValueError: `k` is negative, or `scores` and `candidates` differ in length.
+            ValueError: `scores` and `candidates` differ in length.
         """
-        if k is not None and k < 0:
-            raise ValueError(f"k must be non-negative, got {k}")
         if len(scores) != len(candidates):
             raise ValueError(f"got {len(scores)} scores for {len(candidates)} candidates")
         ranked = [
@@ -287,7 +272,7 @@ class BaseDecisionReranker(abc.ABC):
             if value is not None
         ]
         ranked.sort(key=lambda scored: (-scored.score, scored.index))
-        return ranked[:k] if k is not None else ranked
+        return ranked
 
 
 def _answer_value(answer: object, option: str | None, question_id: str) -> float:
