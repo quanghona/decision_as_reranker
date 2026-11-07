@@ -1,0 +1,90 @@
+name: Build test and scan
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+  workflow_call:
+    inputs:
+      gate_only:
+        description: >-
+          Run Lint/Test/Scan and Build.
+        type: boolean
+        default: false
+
+env:
+  PYTHON_VERSION: "3.10" # minimum supported version
+
+jobs:
+  validate:
+    name: Lint, Test and Scan
+    runs-on: ubuntu-latest
+    permissions:
+      security-events: write # CodeQL SARIF upload
+    steps:
+      # ---------- 1. Environment ----------
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync --group dev --group lint
+
+      # ---------- 2. Lint ----------
+      - name: Ruff check
+        run: uv run ruff check .
+
+      - name: Ruff format check
+        run: uv run ruff format --check .
+
+      # ---------- 3. Tests ----------
+      - name: Run tests
+        run: uv run pytest tests -v
+
+      # ---------- 4. CodeQL security scan ----------
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: python
+
+      - name: Analyze with CodeQL
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: "/language:python"
+
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    needs: validate
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      # ---------- 5. Build ----------
+      - name: Build package
+        run: uv build
+
+      - name: Upload dist artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
