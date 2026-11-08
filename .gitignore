@@ -223,3 +223,6 @@ __marimo__/
 .github/agents/
 .github/skills/
 .github/prompts/
+
+# Notebook run artifacts: streamed CLERC slices and cached noul scores
+notebook/

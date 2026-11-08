@@ -1,15 +1,11 @@
 """The TypeSafe-compatible backend: the System One contract over `typesafe_sdk`.
 
 One concrete adapter in its own file, per the layout `backend.base` describes: the base owns the
-request contract, this module owns the transport call and the SDK -> neutral conversions. It is
-also the only module that may name `typesafe_sdk`: on the request side by widening the base's
-`Question` alias with the SDK's question classes (checkers only -- the SDK accepts its objects and
-the dict form alike), on the answer side by field-copying SDK answers into the neutral dataclasses.
-`typesafe_sdk` is an optional dependency (the `typesafe` extra), and this module is the only one
-that names it -- at module level, so importing `typesafe.py` without the extra fails as an
-`ImportError` from the import itself: loud, immediate, and where it is actionable. The module
-exists only to speak that protocol; the neutral contract in `backend.base` stays importable either
-way, and the client this backend wraps is supplied by the caller, never constructed here.
+request contract, this module owns the transport call and the SDK -> neutral conversions. On the
+request side by widening the base's `Question` alias with the SDK's question classes (checkers
+only -- the SDK accepts its objects and the dict form alike), on the answer side by field-copying
+SDK answers into the neutral dataclasses. `typesafe_sdk` is an optional dependency (the `typesafe`
+extra).
 """
 
 from __future__ import annotations
