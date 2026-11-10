@@ -24,9 +24,12 @@ from __future__ import annotations
 
 import abc
 import logging
+import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Literal
+
+import numpy as np
 
 from decision_as_reranker.backend.base import (
     BaseDecisionBackend,
@@ -435,9 +438,273 @@ class DecisionNoulReranker(BaseDecisionReranker):
         return self.rank(candidates, self.score(query, candidates, decisions))
 
 
+class DecisionChoiceReranker(BaseDecisionReranker):
+    """Rank a shortlist with one `choice` question whose options are the candidates themselves.
+
+    Instead of scoring each passage on its own, ask *which of these passages answers the query?* once,
+    with every candidate as an option, and read the probability returned for each: one joint
+    comparison replaces `K` independent ones, and the answers arrive as a distribution that already
+    sums to 1. The cost is that the candidates are no longer independent, and the joint question
+    carries two biases AnyJev (https://arxiv.org/abs/2610.00831) names and corrects. Each gets its
+    own method here:
+
+    Notation, used throughout: `K` is the number of options -- the shortlist length, fixed by the
+    input and never a knob -- and `k` is the number of orderings of those `K` options asked per
+    rerank, the tunable budget. `k = 1` is the plain joint question; `k = K` is AnyJev's full
+    rotation ensemble.
+
+    * **Position bias** -- some slots in the option list draw probability whatever sits in them.
+      `build_permutations` answers it by reordering the options: the input order plus `k - 1`
+      shuffles of the same `K` options, asked as `k` questions in one request whose answers `score`
+      averages over the `k` permutations. AnyJev rotates through the `K` cyclic orders and averages
+      log-probabilities; random shuffles here decouple the ensemble size from `K` so `k` is tunable
+      independently of the shortlist, and averaging probabilities rather than logs is what the
+      base's aggregation already does.
+    * **Label prior** -- some option names draw probability whatever they describe.
+      `probe_label_prior` measures that skew by asking the same questions with the descriptions
+      removed, and `correct_label_prior` divides it out over the whole vector at once:
+      `p_i proportional to v_i / (q_i + eps) ** alpha`, renormalised. `alpha` is the strength knob
+      of the original work, kept at its default.
+
+    Option names stay pinned to candidates across every ordering -- a shuffle moves a candidate's
+    *position*, never its label -- which is what keeps the two corrections orthogonal: the probe is
+    asked under the same permutations as the content, so position cancels inside the ratio and what
+    survives in `q` is the label prior alone.
+
+    Budget: two requests regardless of `K` -- `k` content questions in one call, plus the `k`-question
+    probe (option names only, no passage text). Set `alpha=0` to skip the probe entirely, or `k=1` to
+    ask a single joint question; with one ordering the probe still removes that ordering's combined
+    label-and-position bias, which is most of the correction for the cost of one extra question.
+
+    Args:
+        backend: The adapter to call; see `BaseDecisionReranker`.
+        instructions: The question asked of every ordering. `query` in the text names the value
+            `build_state` sends. A `str`, or JSON structure if the serving model reads structured
+            instructions.
+        alpha: Strength of the label-prior correction; `0` disables it (and the probe), `1` removes
+            the measured prior exactly, values between interpolate. The AnyJev default is `0.75`.
+        k: Number of orderings of the `K` options to average per rerank, `>= 1`. The first is always
+            the input order; larger `k` averages position bias harder, at `k` questions per call.
+            Capped in effect by `K!`, the number of distinct orderings that exist.
+        seed: Seed for the `numpy.random.Generator` behind the shuffles. `None` draws different
+            orderings per call; set it when results must be reproducible across runs (a cached
+            eval, for instance).
+        eps: Floor added to every measured prior before the division, keeping an option the probe
+            scored at exactly `0` finite. Smaller `eps` corrects harder; leave it alone unless the
+            probe returns exact zeroes.
+        on_error: `"raise"` or `"drop"`; see `BaseDecisionReranker`. Under `"drop"`, a failed probe
+            leaves the ordering uncorrected rather than unscored -- the content answers are still
+            evidence, the prior is not.
+
+    Example:
+        >>> reranker = DecisionChoiceReranker(
+        ...     backend,
+        ...     instructions="Which of these passages answers the query?",
+        ...     k=4,
+        ... )
+        >>> ranked = reranker.rerank(query, passages)[:5]
+        >>> ranked[0].candidate, ranked[0].score
+        ('the passage the joint comparison favoured', 0.41)
+    """
+
+    def __init__(
+        self,
+        backend: BaseDecisionBackend,
+        *,
+        instructions: str | Mapping[str, object] | Sequence[object],
+        alpha: float = 0.75,
+        k: int = 1,
+        seed: int | None = None,
+        on_error: OnError = "raise",
+        eps: float = 1e-7,
+    ) -> None:
+        super().__init__(backend, on_error=on_error)
+        if isinstance(k, bool) or not isinstance(k, int) or k < 1:
+            raise ValueError(f"k must be an int >= 1, got {k!r}")
+        if not np.isfinite(alpha) or alpha < 0:
+            raise ValueError(f"alpha must be a finite non-negative number, got {alpha!r}")
+        if not np.isfinite(eps) or eps <= 0:
+            raise ValueError(f"eps must be a finite positive number, got {eps!r}")
+        self._instructions = instructions
+        self._seed = seed
+        self.alpha = alpha
+        self.k = k
+        self.eps = eps
+
+    @staticmethod
+    def option_names(count: int) -> list[str]:
+        """The option names for `count` candidates: `d0` is candidate 0, in every ordering.
+
+        Short and non-semantic on purpose (see `DecisionQuery`): the labels reach the model, so a
+        meaningful name would itself become a prior to divide out.
+        """
+        return [f"d{index}" for index in range(count)]
+
+    def build_question(self, candidates: Sequence[str], order: Sequence[int]) -> Mapping[str, object]:
+        """The `choice` for one ordering: every candidate as an option, presented in `order`.
+
+        Dict form on purpose -- `Question` accepts it. Names are keyed to candidates, positions to
+        `order`, so two questions differing only in `order` differ only in position.
+
+        Args:
+            candidates: The passages being ranked.
+            order: The permutation of candidate indices to present them in.
+
+        Returns:
+            The question to send for this ordering.
+        """
+        names = self.option_names(len(candidates))
+        criteria = {names[index]: candidates[index] for index in order}
+        return {"type": "choice", "instructions": self._instructions, "criteria": criteria}
+
+    def build_probe_question(self, names: Sequence[str], order: Sequence[int]) -> Mapping[str, object]:
+        """The prior probe for one ordering: the same options in the same order, descriptions removed.
+
+        With no content to distinguish them, whatever skew the model still returns is its prior over
+        the labels and slots -- AnyJev's "unlabelled inputs", asked in-request instead of offline.
+
+        Args:
+            names: The option names, in candidate order.
+            order: The same permutation the content question was built with.
+
+        Returns:
+            The probe question to send alongside the content questions.
+        """
+        criteria = {names[index]: None for index in order}
+        return {"type": "choice", "instructions": self._instructions, "criteria": criteria}
+
+    def build_permutations(self, count: int) -> list[tuple[int, ...]]:
+        """The `k` orderings of the `K` options whose answers get averaged -- the position-bias fix.
+
+        `count` is `K`, fixed by the shortlist; the returned list has `min(self.k, K!)` entries,
+        each a permutation of `range(K)`, so the ensemble size is tuned by `k` and never inflated
+        by `K`.
+        The first ordering is the input order, so `k=1` is deterministic and asks the shortlist as
+        given. The rest come off a `numpy.random.Generator` seeded with `seed` as vectorised batches:
+        sorting independent uniform keys per row is a uniform permutation, so drawing the whole
+        remaining deficit costs one call with no per-row Python work. Rows colliding with an order
+        already held are dropped and the deficit redrawn -- bounded by `K!`, the number of distinct
+        orderings that exist. When `k` exceeds `K!` the ensemble truncates to `K!`: a repeated
+        ordering is the same question with the same answer, so padding it in would spend a slot
+        for no information.
+
+        Args:
+            count: `K`, the number of options, i.e. the length of each ordering.
+
+        Returns:
+            `min(self.k, K!)` tuples, each a permutation of `range(count)`, the first one sorted.
+        """
+        identity = tuple(range(count))
+        if self.k == 1:
+            return [identity]
+        rng = np.random.default_rng(self._seed)
+        orders = [identity]
+        seen = {identity}
+        # Exact big-int K!, with the argument capped so the factorial stays cheap for an absurdly
+        # long shortlist; past the cap, K! is still far beyond any usable k, so the bound is
+        # behaviourally identical and only saves the multiplication.
+        max_permutations = math.factorial(min(count, 1558))
+        while len(orders) < self.k and len(orders) < max_permutations:
+            keys = rng.random((self.k - len(orders), count))
+            for row in np.argsort(keys, axis=1):
+                order = tuple(row.tolist())
+                if order not in seen:
+                    seen.add(order)
+                    orders.append(order)
+        return orders
+
+    def probe_label_prior(
+        self,
+        query: str,
+        candidates: Sequence[str],
+        orders: Sequence[Sequence[int]] | None = None,
+    ) -> list[float | None]:
+        """Estimate the label prior by asking the option set with its content removed.
+
+        One probe question per ordering, averaged by `score` exactly like the content request --
+        pairing the two ensembles is what makes position cancel in the ratio.
+
+        Args:
+            query: The retrieval query, sent in `state` as always.
+            candidates: The passages whose option names are being calibrated.
+            orders: The orderings to probe; pass the ones the content request used. Fresh shuffles
+                when omitted.
+
+        Returns:
+            One prior probability (or `None`) per candidate, positionally aligned with `candidates`.
+        """
+        names = self.option_names(len(candidates))
+        targets = {index: names[index] for index in range(len(names))}
+        orders = list(orders) if orders is not None else self.build_permutations(len(candidates))
+        decisions = [DecisionQuery(self.build_probe_question(names, order), targets) for order in orders]
+        return self.score(query, candidates, decisions)
+
+    def correct_label_prior(self, values: Sequence[float | None], priors: Sequence[float]) -> list[float | None]:
+        """Divide the measured prior out of a probability vector and renormalise it.
+
+        `p_i = v_i / (q_i + eps) ** alpha`, renormalised over the scored candidates -- the AnyJev
+        debiasing evaluated as whole-vector numpy operations, no per-candidate Python loop.
+        `alpha=0` returns the values unchanged; `alpha=1` returns the content-only ratio.
+
+        Args:
+            values: Per-candidate probabilities, `None` where the backend came back unanswered.
+            priors: The measured prior for the same candidates, positionally aligned.
+
+        Returns:
+            The corrected probabilities, summing to 1 over the scored candidates; `None` stays `None`.
+
+        Raises:
+            ValueError: `priors` and `values` differ in length.
+        """
+        if len(priors) != len(values):
+            raise ValueError(f"got {len(priors)} priors for {len(values)} candidates")
+        count = len(values)
+        scored = np.fromiter((value is not None for value in values), dtype=bool, count=count)
+        vector = np.fromiter(((0.0 if value is None else value) for value in values), dtype=float, count=count)
+        prior = np.fromiter(priors, dtype=float, count=count)
+        weights = vector / (prior + self.eps) ** self.alpha
+        total = weights[scored].sum()
+        if total > 0:
+            weights = weights / total
+        return [None if not hit else float(weight) for hit, weight in zip(scored, weights)]
+
+    def rerank(self, query: str, candidates: Sequence[str]) -> list[ScoredCandidate]:
+        """Rank the shortlist on one joint `choice`, averaged over orderings and divided by its prior.
+
+        Args:
+            query: The information need the passages were retrieved for.
+            candidates: The passages to rank, in input order.
+
+        Returns:
+            The candidates best first, ties broken by input position; unscored ones are absent under
+            `on_error="drop"`.
+
+        Raises:
+            ValueError: `priors` and `values` differ in length, or a probability lands outside
+                `[0, 1]` -- an off-contract backend.
+            KeyError: A question came back unanswered and `on_error="raise"`.
+            BaseException: Whatever the backend's `transport_errors` name, when `on_error="raise"`.
+        """
+        if not candidates:
+            return []
+        names = self.option_names(len(candidates))
+        targets = {index: names[index] for index in range(len(names))}
+        orders = self.build_permutations(len(candidates))
+        decisions = [DecisionQuery(self.build_question(candidates, order), targets) for order in orders]
+        values = self.score(query, candidates, decisions)
+
+        if self.alpha > 0:
+            priors = [prior for prior in self.probe_label_prior(query, candidates, orders) if prior is not None]
+            if len(priors) == len(candidates):
+                values = self.correct_label_prior(values, priors)
+            else:
+                logger.warning("label prior could not be measured; ranking the uncorrected probabilities")
+        return self.rank(candidates, values)
+
 
 __all__ = [
     "BaseDecisionReranker",
+    "DecisionChoiceReranker",
     "DecisionNoulReranker",
     "DecisionQuery",
     "ScoredCandidate",

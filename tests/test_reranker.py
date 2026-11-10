@@ -7,6 +7,8 @@ probability from a live model -- only ordering, bounds, and error propagation.
 
 from __future__ import annotations
 
+import math
+
 import pytest
 from typesafe_sdk import Choice, Noul, Score, SystemOneResponse
 from typesafe_sdk import ChoiceAnswer as SDKChoiceAnswer
@@ -440,9 +442,283 @@ def test_noul_reranker_requires_a_backend_and_its_question_text():
     assert reranker.backend is backend
 
 
-# --------------------------------------------------------------------------- untouched subclasses
+# --------------------------------------------------------------------------- choice reranker
 
 
-def test_choice_stub_still_satisfies_the_abstract_interface():
-    # Left alone this session: it constructs, and its `rerank` is unimplemented.
-    assert DecisionChoiceReranker().rerank(CANDIDATES, [0.1, 0.2, 0.3]) is None
+class ChoiceBackend(FakeBackend):
+    """A `choice` model with separable, switchable biases: P(option) ∝ name x position.
+
+    `name_weights` is the label prior and `position_weights` the position bias; leaving either out
+    switches that defect off. A probe question (descriptions all `None`) is answered by the same
+    formula, which is the point of a probe: with the content removed, only the biases are left.
+    `fail_on_probe` raises the transport error on probe requests only -- the prior is optional
+    evidence, the candidate answers are not.
+    """
+
+    def __init__(self, name_weights=None, position_weights=None, fail_on_probe=False, **kwargs):
+        super().__init__(**kwargs)
+        self.name_weights = name_weights or {}
+        self.position_weights = position_weights
+        self.fail_on_probe = fail_on_probe
+
+    @staticmethod
+    def _is_probe(question):
+        return all(description is None for description in question["criteria"].values())
+
+    def _ask(self, state, questions):
+        self.calls.append({"state": state, "questions": questions, "model": self.model})
+        if self.error is not None:
+            raise self.error
+        if self.fail_on_probe and any(self._is_probe(q) for q in questions.values()):
+            raise ConnectionError("prior probe unavailable")
+        answers = {}
+        for question_id, question in questions.items():
+            names = list(question["criteria"])
+            slots = self.position_weights or [1.0] * len(names)
+            raw = {name: self.name_weights.get(name, 1.0) * slots[slot] for slot, name in enumerate(names)}
+            total = sum(raw.values())
+            probabilities = {name: value / total for name, value in raw.items()}
+            best = max(probabilities, key=lambda name: probabilities[name])
+            answers[question_id] = ChoiceAnswer(choice=best, probabilities=probabilities)
+        return DecisionResponse(answers=answers, model="kev-latest")
+
+
+def choice_reranker(backend, **kwargs):
+    """A `DecisionChoiceReranker` with the required question text filled in; kwargs override."""
+    settings = {"instructions": "Which of these passages answers the query?"}
+    settings.update(kwargs)
+    return DecisionChoiceReranker(backend, **settings)
+
+
+LABEL_PRIOR = {"d0": 0.5, "d1": 0.3, "d2": 0.2}
+
+
+def test_choice_reranker_requires_a_backend_and_its_question_text():
+    # Regression: the stub took only `alpha`, so a reranker with no transport and no question
+    # constructed fine -- and its `rerank` returned None silently instead of ranking.
+    with pytest.raises(TypeError):
+        DecisionChoiceReranker()  # type: ignore[call-arg]
+    with pytest.raises(TypeError):
+        DecisionChoiceReranker(FakeBackend())  # type: ignore[call-arg]
+
+    backend = FakeBackend()
+    reranker = choice_reranker(backend)
+    assert isinstance(reranker, BaseDecisionReranker)
+    assert reranker.backend is backend
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [{"alpha": -0.5}, {"alpha": math.inf}, {"eps": 0.0}, {"eps": math.nan}, {"k": 0}, {"k": 2.5}],
+)
+def test_choice_reranker_rejects_off_contract_knobs(kwargs):
+    with pytest.raises(ValueError):
+        choice_reranker(FakeBackend(), **kwargs)
+
+
+def test_choice_reranker_reads_one_joint_distribution_per_ordering():
+    backend = ChoiceBackend(position_weights=[0.6, 0.3, 0.1])
+
+    ranked = choice_reranker(backend, alpha=0).rerank("q", CANDIDATES)
+
+    assert len(backend.calls) == 1, "one choice over all candidates, not one question per candidate"
+    assert sorted(backend.calls[0]["questions"]) == ["q0"]
+    assert [entry.index for entry in ranked] == [0, 1, 2]
+    assert [entry.score for entry in ranked] == pytest.approx([0.6, 0.3, 0.1])
+
+
+def test_choice_reranker_asks_every_ordering_in_one_request_with_names_pinned_to_candidates():
+    backend = ChoiceBackend()
+
+    choice_reranker(backend, k=3, alpha=0).rerank("q", CANDIDATES)
+
+    assert len(backend.calls) == 1, "k orderings are k questions in one call, not k calls"
+    asked = backend.calls[0]["questions"]
+    assert sorted(asked) == ["q0", "q1", "q2"]
+    for question in asked.values():
+        assert sorted(question["criteria"]) == ["d0", "d1", "d2"]
+        assert question["criteria"]["d0"] == CANDIDATES[0], "a shuffle moves positions, never labels"
+    assert list(asked["q0"]["criteria"]) == ["d0", "d1", "d2"], "the first ordering is the input order"
+
+
+def test_choice_reranker_averages_position_bias_over_the_k_permutations():
+    positions = [0.7, 0.2, 0.1]
+    backend = ChoiceBackend(position_weights=positions)
+    reranker = choice_reranker(backend, k=6, alpha=0, seed=3)
+
+    orders = reranker.build_permutations(len(CANDIDATES))
+    expected = [sum(positions[order.index(i)] for order in orders) / len(orders) for i in range(len(CANDIDATES))]
+    ranked = reranker.rerank("q", CANDIDATES)
+
+    assert [entry.score for entry in ranked] == pytest.approx(sorted(expected, reverse=True))
+    assert max(expected) < positions[0], "no candidate may keep the first slot's whole advantage"
+
+
+def test_alpha_one_divides_the_label_prior_out_exactly():
+    backend = ChoiceBackend(name_weights=LABEL_PRIOR)
+
+    ranked = choice_reranker(backend, alpha=1.0).rerank("q", CANDIDATES)
+
+    assert [entry.score for entry in ranked] == [pytest.approx(1 / 3)] * 3
+    assert [entry.index for entry in ranked] == [0, 1, 2], "an even field ranks by input position"
+
+
+def test_the_prior_is_divided_out_to_the_alpha_power():
+    backend = ChoiceBackend(name_weights=LABEL_PRIOR)
+
+    ranked = choice_reranker(backend, alpha=0.75).rerank("q", CANDIDATES)
+
+    weights = [value**0.25 for value in LABEL_PRIOR.values()]
+    assert [entry.score for entry in ranked] == pytest.approx([w / sum(weights) for w in weights])
+
+
+def test_alpha_zero_skips_the_prior_probe():
+    backend = ChoiceBackend(name_weights=LABEL_PRIOR)
+
+    choice_reranker(backend, alpha=0).rerank("q", CANDIDATES)
+
+    assert len(backend.calls) == 1, "no correction means no calibration request"
+
+
+def test_the_prior_probe_reuses_the_orderings_without_the_candidate_text():
+    backend = ChoiceBackend(name_weights=LABEL_PRIOR)
+
+    choice_reranker(backend, k=3).rerank("q", CANDIDATES)
+
+    content, probed = (call["questions"] for call in backend.calls)
+    assert [list(q["criteria"]) for q in probed.values()] == [list(q["criteria"]) for q in content.values()]
+    assert all(value is None for question in probed.values() for value in question["criteria"].values())
+    assert backend.calls[1]["state"] == {"query": "q"}
+
+
+def test_correct_label_prior_renormalises_the_divided_vector():
+    reranker = choice_reranker(FakeBackend(), alpha=1.0)
+
+    assert reranker.correct_label_prior([0.5, 0.3, 0.2], [0.5, 0.3, 0.2]) == [pytest.approx(1 / 3)] * 3
+    assert reranker.correct_label_prior([0.2, 0.8], [0.5, 0.5]) == pytest.approx([0.2, 0.8])
+
+
+def test_a_zero_prior_is_floored_not_divided_by():
+    reranker = choice_reranker(FakeBackend(), alpha=1.0)
+
+    assert reranker.correct_label_prior([0.0, 1.0], [0.0, 1.0]) == [0.0, pytest.approx(1.0)]
+
+
+def test_eps_damps_the_boost_a_zero_prior_receives():
+    # The whole-vector division is (q + eps) ** -alpha, so eps is the only lever on an option the
+    # probe scored at exactly 0: the smaller the floor, the more the division inflates its share.
+    tight = choice_reranker(FakeBackend(), alpha=1.0, eps=1e-7)
+    loose = choice_reranker(FakeBackend(), alpha=1.0, eps=1e-2)
+
+    assert tight.correct_label_prior([0.5, 0.5], [0.0, 1.0])[0] > loose.correct_label_prior([0.5, 0.5], [0.0, 1.0])[0]
+
+
+def test_unscored_candidates_stay_out_of_the_renormalisation():
+    reranker = choice_reranker(FakeBackend(), alpha=1.0)
+
+    assert reranker.correct_label_prior([0.5, None, 0.5], [0.5, 0.5, 0.5]) == [0.5, None, 0.5]
+
+
+def test_correct_label_prior_needs_one_prior_per_candidate():
+    with pytest.raises(ValueError, match="1 priors for 2"):
+        choice_reranker(FakeBackend()).correct_label_prior([0.5, 0.5], [1.0])
+
+
+def test_build_permutations_returns_k_orderings_of_the_K_options():
+    # K (the shortlist length) fixes how long each ordering is; k fixes how many there are. The
+    # draw budget is k, not a retry count, so an ensemble as large as the option space is filled
+    # exactly: 4! = 24 orderings of 4 options, all of them present once.
+    orders = choice_reranker(FakeBackend(), k=24, seed=7).build_permutations(4)
+
+    assert len(orders) == 24 == len(set(orders))
+    assert orders[0] == (0, 1, 2, 3)
+    assert all(sorted(order) == [0, 1, 2, 3] for order in orders)
+
+
+def test_build_permutations_truncates_at_K_factorial_instead_of_repeating():
+    # 2 options have only 2! = 2 distinct orderings; asking for k=5 draws 2, not 5 padded with
+    # repeats -- a repeated ordering is the same question with the same answer, so the ensemble
+    # shrinks rather than spending a slot for no information.
+    orders = choice_reranker(FakeBackend(), k=5, seed=2).build_permutations(2)
+
+    assert len(orders) == 2
+    assert set(orders) == {(0, 1), (1, 0)}
+
+
+def test_build_permutations_scales_with_k_not_with_K():
+    # A 3-option shortlist and a 30-option one both get exactly k orderings: the ensemble size is
+    # the tuned budget, decoupled from K the way AnyJev's K-rotation ensemble is not.
+    drawn = [choice_reranker(FakeBackend(), k=4, seed=11).build_permutations(count) for count in (3, 30)]
+
+    assert [len(orders) for orders in drawn] == [4, 4]
+    assert all(len(set(orders)) == 4 for orders in drawn)
+
+
+def test_choice_reranker_asks_k_questions_per_request():
+    backend = ChoiceBackend()
+
+    choice_reranker(backend, k=5, alpha=0).rerank("q", CANDIDATES)
+
+    assert sorted(backend.calls[0]["questions"]) == [f"q{i}" for i in range(5)]
+
+
+def test_build_permutations_starts_sorted_and_honours_the_budget():
+    orders = choice_reranker(FakeBackend(), k=4, seed=7).build_permutations(3)
+
+    assert len(orders) == 4 == len(set(orders))
+    assert orders[0] == (0, 1, 2)
+    assert all(sorted(order) == [0, 1, 2] for order in orders)
+
+
+def test_build_permutations_is_reproducible_under_a_seed():
+    drawn = [choice_reranker(FakeBackend(), k=5, seed=1).build_permutations(4) for _ in range(2)]
+
+    assert drawn[0] == drawn[1], "a cached eval must redraw the same ensembles it scored"
+
+
+def test_choice_reranker_never_reaches_the_backend_for_an_empty_shortlist():
+    backend = ChoiceBackend()
+
+    assert choice_reranker(backend).rerank("q", []) == []
+    assert backend.calls == []
+
+
+def test_choice_reranker_propagates_a_transport_failure_instead_of_ranking_zeroes():
+    reranker = choice_reranker(ChoiceBackend(error=ConnectionError("down")))
+
+    with pytest.raises(ConnectionError):
+        reranker.rerank("q", CANDIDATES)
+
+
+def test_choice_reranker_drops_everything_when_the_backend_is_unreachable():
+    reranker = choice_reranker(ChoiceBackend(error=ConnectionError("down")), on_error="drop")
+
+    assert reranker.rerank("q", CANDIDATES) == []
+
+
+def test_a_failed_prior_probe_leaves_the_ordering_uncorrected_not_unscored():
+    # The probe is auxiliary: losing it costs the debiasing, not the ranking. Under `raise` the
+    # failure still aborts -- this is the `drop` policy's judgement, not a silent fallback.
+    backend = ChoiceBackend(name_weights=LABEL_PRIOR, fail_on_probe=True)
+
+    ranked = choice_reranker(backend, on_error="drop").rerank("q", CANDIDATES)
+
+    assert [entry.score for entry in ranked] == [0.5, 0.3, 0.2]
+
+
+def test_choice_reranker_emits_a_question_the_sdk_accepts():
+    question = choice_reranker(FakeBackend()).build_question(CANDIDATES, (2, 0, 1))
+
+    parsed = Choice.model_validate(question)
+    assert parsed.instructions == "Which of these passages answers the query?"
+    assert parsed.criteria == {f"d{i}": CANDIDATES[i] for i in range(3)}
+    assert list(parsed.criteria) == ["d2", "d0", "d1"], "the ordering is the position signal"
+
+
+def test_choice_reranker_scores_duplicate_passages_as_separate_options():
+    backend = ChoiceBackend(position_weights=[0.5, 0.5])
+
+    ranked = choice_reranker(backend, alpha=0).rerank("q", ["same", "same"])
+
+    assert [entry.index for entry in ranked] == [0, 1]
+    assert list(backend.calls[0]["questions"]["q0"]["criteria"].values()) == ["same", "same"]
