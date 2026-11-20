@@ -1,6 +1,6 @@
 [project]
 name = "decision-as-reranker"
-version = "0.1.0"
+version = "0.1.1"
 description = "Typed decision model as a reranker for RAG"
 readme = "README.md"
 license = "MIT"
@@ -9,11 +9,16 @@ authors = [
     { name = "Quang Hon Ly", email = "lyhonquang@gmail.com" }
 ]
 requires-python = ">=3.10,<3.14"
-dependencies = []
+dependencies = [
+    "numpy>=2.0.0",
+]
 
 [project.optional-dependencies]
 typesafe = [
     "typesafe-sdk>=0.7.5",
+]
+openai = [
+    "openai>=3.38",
 ]
 
 [build-system]
@@ -38,6 +43,7 @@ target-version = "py310"
 [dependency-groups]
 dev = [
     "ipykernel>=7.3.0",
+    "openai>=3.38",
     "pytest>=9.2.0",
     "ruff>=0.17.3",
     "typesafe-sdk>=0.7.5",
