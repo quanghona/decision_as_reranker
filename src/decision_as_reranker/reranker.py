@@ -32,6 +32,7 @@ from typing import Literal
 import numpy as np
 
 from decision_as_reranker.backend.base import (
+    Answer,
     BaseDecisionBackend,
     ChoiceAnswer,
     DecisionResponse,
@@ -165,7 +166,7 @@ class BaseDecisionReranker(abc.ABC):
         return self._backend.ask(state, questions)
 
     def score(self, query: str, candidates: Sequence[str], decisions: Sequence[DecisionQuery]) -> list[float | None]:
-        """Ask the model once and return one relevance in `[0, 1]` per candidate, in input order.
+        """Send `decisions` to the model and return one relevance in `[0, 1]` per candidate, in input order.
 
         `None` marks a candidate that could not be scored; that happens only under
         `on_error="drop"`, and never as a numeric stand-in for a failure.
@@ -441,7 +442,7 @@ class DecisionNoulReranker(BaseDecisionReranker):
 class DecisionChoiceReranker(BaseDecisionReranker):
     """Rank a shortlist with one `choice` question whose options are the candidates themselves.
 
-    Instead of scoring each passage on its own, ask *which of these passages answers the query?* once,
+    Instead of scoring each passage on its own, ask *which of these passages answers the query?*
     with every candidate as an option, and read the probability returned for each: one joint
     comparison replaces `K` independent ones, and the answers arrive as a distribution that already
     sums to 1. The cost is that the candidates are no longer independent, and the joint question
@@ -455,8 +456,10 @@ class DecisionChoiceReranker(BaseDecisionReranker):
 
     * **Position bias** -- some slots in the option list draw probability whatever sits in them.
       `build_permutations` answers it by reordering the options: the input order plus `k - 1`
-      shuffles of the same `K` options, asked as `k` questions in one request whose answers `score`
-      averages over the `k` permutations. AnyJev rotates through the `K` cyclic orders and averages
+      shuffles of the same `K` options, asked as `k` separate requests under the same state --
+      `ask` here sends one ordering per request, the way Kev's `/v1/systemone/permute` runs each
+      order as its own pass -- whose answers `score` averages over the `k` permutations.
+      AnyJev rotates through the `K` cyclic orders and averages
       log-probabilities; random shuffles here decouple the ensemble size from `K` so `k` is tunable
       independently of the shortlist, and averaging probabilities rather than logs is what the
       base's aggregation already does.
@@ -471,10 +474,14 @@ class DecisionChoiceReranker(BaseDecisionReranker):
     asked under the same permutations as the content, so position cancels inside the ratio and what
     survives in `q` is the label prior alone.
 
-    Budget: two requests regardless of `K` -- `k` content questions in one call, plus the `k`-question
-    probe (option names only, no passage text). Set `alpha=0` to skip the probe entirely, or `k=1` to
-    ask a single joint question; with one ordering the probe still removes that ordering's combined
-    label-and-position bias, which is most of the correction for the cost of one extra question.
+    Budget: `2k` requests regardless of `K` -- `k` content requests, one per ordering, plus the
+    `k`-request probe (option names only, no passage text), every one carrying the same state.
+    Packing the orderings into one request would not be the same measurement: questions inside a
+    request share one pass over the state, so permuted copies of the same option set would be
+    answered jointly and stop being independent samples of the ordering effect. Set `alpha=0` to
+    skip the probe entirely, or `k=1` to ask a single joint question; with one ordering the probe
+    still removes that ordering's combined label-and-position bias, which is most of the correction
+    for the cost of one extra request.
 
     Args:
         backend: The adapter to call; see `BaseDecisionReranker`.
@@ -484,7 +491,7 @@ class DecisionChoiceReranker(BaseDecisionReranker):
         alpha: Strength of the label-prior correction; `0` disables it (and the probe), `1` removes
             the measured prior exactly, values between interpolate. The AnyJev default is `0.75`.
         k: Number of orderings of the `K` options to average per rerank, `>= 1`. The first is always
-            the input order; larger `k` averages position bias harder, at `k` questions per call.
+            the input order; larger `k` averages position bias harder, at `k` requests per rerank.
             Capped in effect by `K!`, the number of distinct orderings that exist.
         seed: Seed for the `numpy.random.Generator` behind the shuffles. `None` draws different
             orderings per call; set it when results must be reproducible across runs (a cached
@@ -531,6 +538,36 @@ class DecisionChoiceReranker(BaseDecisionReranker):
         self.k = k
         self.eps = eps
 
+    def ask(self, state: Mapping[str, object], questions: Mapping[str, Question]) -> DecisionResponse:
+        """Send one request per question, every request carrying the same state.
+
+        Overrides the base's single-request shape because the ordering ensemble is only meaningful
+        across independent passes: questions packed into one request share the model's single read
+        of the state, so permuted copies of the same option set would be answered jointly and their
+        probabilities would no longer be `k` samples of the ordering effect. This is Kev's
+        `/v1/systemone/permute` shape -- each order is its own pass. The answers are merged back
+        into one `DecisionResponse`, so `score`'s averaging, error policy and ordering all apply
+        unchanged; `usage` and `request_id` are not merged, because they are log-only and no
+        single request's values describe the `k` calls together.
+
+        Args:
+            state: Context shared by every question, from `build_state`. Sent verbatim with each
+                request -- the orderings differ in position, never in state.
+            questions: Question id to question; one request is made for each.
+
+        Returns:
+            A `DecisionResponse` holding every question's answer.
+        """
+        if not questions:
+            return super().ask(state, questions)
+        answers: dict[str, Answer] = {}
+        model = ""
+        for question_id, question in questions.items():
+            response = super().ask(state, {question_id: question})
+            answers.update(response.answers)
+            model = response.model
+        return DecisionResponse(answers=answers, model=model)
+
     @staticmethod
     def option_names(count: int) -> list[str]:
         """The option names for `count` candidates: `d0` is candidate 0, in every ordering.
@@ -561,14 +598,14 @@ class DecisionChoiceReranker(BaseDecisionReranker):
         """The prior probe for one ordering: the same options in the same order, descriptions removed.
 
         With no content to distinguish them, whatever skew the model still returns is its prior over
-        the labels and slots -- AnyJev's "unlabelled inputs", asked in-request instead of offline.
+        the labels and slots -- AnyJev's "unlabelled inputs", asked live instead of offline.
 
         Args:
             names: The option names, in candidate order.
             order: The same permutation the content question was built with.
 
         Returns:
-            The probe question to send alongside the content questions.
+            The probe question to send, under the same state and ordering as its content twin.
         """
         criteria = {names[index]: None for index in order}
         return {"type": "choice", "instructions": self._instructions, "criteria": criteria}
@@ -621,8 +658,8 @@ class DecisionChoiceReranker(BaseDecisionReranker):
     ) -> list[float | None]:
         """Estimate the label prior by asking the option set with its content removed.
 
-        One probe question per ordering, averaged by `score` exactly like the content request --
-        pairing the two ensembles is what makes position cancel in the ratio.
+        One probe request per ordering, under the same state and the same orderings the content
+        ensemble used -- pairing the two ensembles is what makes position cancel in the ratio.
 
         Args:
             query: The retrieval query, sent in `state` as always.

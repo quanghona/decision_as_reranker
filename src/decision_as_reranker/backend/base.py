@@ -46,6 +46,7 @@ from typing_extensions import Self
 
 logger = logging.getLogger(__name__)
 
+
 @dataclass(frozen=True)
 class NoulAnswer:
     """P(yes) for one yes/no question. The value itself is the relevance; no option names."""
