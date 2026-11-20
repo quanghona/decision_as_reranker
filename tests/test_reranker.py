@@ -527,18 +527,21 @@ def test_choice_reranker_reads_one_joint_distribution_per_ordering():
     assert [entry.score for entry in ranked] == pytest.approx([0.6, 0.3, 0.1])
 
 
-def test_choice_reranker_asks_every_ordering_in_one_request_with_names_pinned_to_candidates():
+def test_choice_reranker_asks_one_request_per_ordering_with_names_pinned_to_candidates():
     backend = ChoiceBackend()
 
     choice_reranker(backend, k=3, alpha=0).rerank("q", CANDIDATES)
 
-    assert len(backend.calls) == 1, "k orderings are k questions in one call, not k calls"
-    asked = backend.calls[0]["questions"]
-    assert sorted(asked) == ["q0", "q1", "q2"]
-    for question in asked.values():
+    assert len(backend.calls) == 3, "k orderings are k requests, not k questions in one call"
+    assert [sorted(call["questions"]) for call in backend.calls] == [[f"q{i}"] for i in range(3)]
+    for call in backend.calls:
+        assert len(call["questions"]) == 1, "each request carries exactly one ordering"
+        assert call["state"] == {"query": "q"}, "the orderings differ in position, never in state"
+    asked = [next(iter(call["questions"].values())) for call in backend.calls]
+    for question in asked:
         assert sorted(question["criteria"]) == ["d0", "d1", "d2"]
         assert question["criteria"]["d0"] == CANDIDATES[0], "a shuffle moves positions, never labels"
-    assert list(asked["q0"]["criteria"]) == ["d0", "d1", "d2"], "the first ordering is the input order"
+    assert list(asked[0]["criteria"]) == ["d0", "d1", "d2"], "the first ordering is the input order"
 
 
 def test_choice_reranker_averages_position_bias_over_the_k_permutations():
@@ -585,10 +588,12 @@ def test_the_prior_probe_reuses_the_orderings_without_the_candidate_text():
 
     choice_reranker(backend, k=3).rerank("q", CANDIDATES)
 
-    content, probed = (call["questions"] for call in backend.calls)
-    assert [list(q["criteria"]) for q in probed.values()] == [list(q["criteria"]) for q in content.values()]
-    assert all(value is None for question in probed.values() for value in question["criteria"].values())
-    assert backend.calls[1]["state"] == {"query": "q"}
+    assert len(backend.calls) == 6, "k content requests, then the k-request probe"
+    content = [next(iter(call["questions"].values())) for call in backend.calls[:3]]
+    probed = [next(iter(call["questions"].values())) for call in backend.calls[3:]]
+    assert [list(q["criteria"]) for q in probed] == [list(q["criteria"]) for q in content]
+    assert all(value is None for question in probed for value in question["criteria"].values())
+    assert all(call["state"] == {"query": "q"} for call in backend.calls), "one state, asked twice"
 
 
 def test_correct_label_prior_renormalises_the_divided_vector():
@@ -654,12 +659,13 @@ def test_build_permutations_scales_with_k_not_with_K():
     assert all(len(set(orders)) == 4 for orders in drawn)
 
 
-def test_choice_reranker_asks_k_questions_per_request():
+def test_choice_reranker_spends_k_requests_per_content_ensemble():
     backend = ChoiceBackend()
 
     choice_reranker(backend, k=5, alpha=0).rerank("q", CANDIDATES)
 
-    assert sorted(backend.calls[0]["questions"]) == [f"q{i}" for i in range(5)]
+    assert len(backend.calls) == 5, "each ordering is its own pass over the same state"
+    assert [sorted(call["questions"]) for call in backend.calls] == [[f"q{i}"] for i in range(5)]
 
 
 def test_build_permutations_starts_sorted_and_honours_the_budget():
