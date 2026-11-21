@@ -50,6 +50,9 @@ dev = [
     "ruff>=0.17.3",
     "typesafe-sdk>=0.7.5",
 ]
+lint = [
+    "ruff>=0.17.3",
+]
 eval = [
     "bm25s>=0.2.0",
     "matplotlib>=3.8",
