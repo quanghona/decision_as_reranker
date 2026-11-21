@@ -1,4 +1,3 @@
-#!/usr/bin/env -S uv run python
 """Serve a decision model as a vLLM-compatible reranking endpoint.
 
 One process, one decision model, the HTTP surface vLLM's reranker exposes: `POST /rerank`,
